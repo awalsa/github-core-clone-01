@@ -16,7 +16,11 @@ import (
 )
 
 func main() {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Bind the dual-stack wildcard: the env dials the entry at the address
+	// the register request came from, which is ::1 when the entrypoint's
+	// fetch reaches it over IPv6 loopback. An IPv4-only bind would refuse
+	// those connections and fail boot.
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[forge] listen: %v\n", err)
 		os.Exit(1)
