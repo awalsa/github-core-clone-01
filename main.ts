@@ -1,16 +1,18 @@
 // main.ts — the process lifecycle for the forge.
 //
 // The harness (env) owns the trial: it hands this process an origin through
-// MAKEFUN_ENV_URL, and this file's only job is to (a) start the server from
-// app.ts on a kernel-chosen port, (b) tell the env that port, and (c) stay
+// MAKEFUN_ENV_URL, and this file's only job is to (a) start the Go forge
+// binary on a kernel-chosen port, (b) tell the env that port, and (c) stay
 // alive until the env reports the trial finished, then shut down cleanly.
-// Nothing here implements the forge itself; the suite grades app.ts.
+// The forge itself lives in ./go/forge (a statically linked binary the
+// rules allow as vendored source); this file only supervises it.
 //
 // Order of operations:
 //   1. Read MAKEFUN_ENV_URL. Missing means there is no env at all: bail out
 //      with exit code 1 instead of hanging.
-//   2. Build the server and listen on port 0. The kernel picks the port; the
-//      env's own port (8080 in a trial container) is never touched.
+//   2. Spawn ./go/forge. It binds 127.0.0.1:0 and prints PORT=<n> on its
+//      stdout; the kernel picks the port, the env's own port (8080 in a
+//      trial container) is never touched.
 //   3. POST { port } to <env>/register and retry until it lands. A 200 means
 //      the env took it; a 409 means some entry already claimed the slot, in
 //      which case waiting is still correct. 400/405 are contract mistakes and
@@ -18,12 +20,12 @@
 //   4. Poll <env>/done until it answers {"done": true}. The env responds
 //      immediately either way, so this is a plain poll with a pause between
 //      tries that doubles up to a cap.
-//   5. Close the server and exit 0. The harness stops the env afterwards and
-//      the scorer reads the export it writes.
+//   5. Stop the forge child and exit 0. The harness stops the env afterwards
+//      and the scorer reads the export it writes.
 
-import { createApp } from "./app.ts";
-
-type AppServer = ReturnType<typeof createApp>;
+import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** One HTTP round trip may take at most this long before it is dropped. */
 const REQUEST_BUDGET_MS = 30_000;
@@ -53,23 +55,48 @@ if (envOrigin === "") {
   process.exit(1);
 }
 
-/** Start the server on a free port and hand back the port it bound. */
-function bindServer(server: AppServer): Promise<number> {
+const forgePath = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "go",
+  "forge",
+);
+
+/**
+ * Start the forge binary and wait for it to print its port. The child's
+ * stdin stays open (its dead-man's switch: it exits when stdin closes);
+ * its stderr is inherited so forge logs reach the trial log.
+ */
+function startForge(): Promise<{ child: ChildProcess; port: number }> {
   return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, () => {
-      const where = server.address();
-      if (where === null || typeof where === "string") {
-        reject(new Error("the server did not end up on a TCP port"));
-        return;
+    const child = spawn(forgePath, [], {
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    let settled = false;
+    let buffered = "";
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(err);
+    };
+    child.once("error", (err) => fail(err));
+    child.once("exit", (code) => {
+      if (!settled) fail(new Error(`the forge binary exited early with code ${code}`));
+    });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      buffered += chunk.toString("utf8");
+      const match = buffered.match(/PORT=(\d+)/);
+      if (match) {
+        settled = true;
+        resolve({ child, port: parseInt(match[1], 10) });
       }
-      resolve(where.port);
     });
   });
 }
 
 /**
- * Tell the env which port the server bound. Returns once the env has the
+ * Tell the env which port the forge bound. Returns once the env has the
  * number (200) or another entry already holds the slot (409). Contract
  * errors (400/405) abort the run; everything else is retried, since the env
  * may still be starting.
@@ -117,18 +144,36 @@ async function waitUntilDone(): Promise<void> {
   }
 }
 
-/** The whole life of the process: bind, register, wait, shut down. */
+/** Stop the forge child: SIGTERM, then SIGKILL if it lingers. */
+async function stopForge(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  await Promise.race([
+    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    sleep(2_000),
+  ]);
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  try {
+    child.stdin?.end();
+  } catch {
+    // The child's stdin may already be gone; nothing to do.
+  }
+}
+
+/** The whole life of the process: start the forge, register, wait, stop it. */
 async function run(): Promise<void> {
-  const server = createApp();
-  const port = await bindServer(server);
-  log(`listening on port ${port}`);
+  const { child, port } = await startForge();
+  log(`forge listening on port ${port}`);
 
-  await announce(port);
-  log("registered; waiting for the env to say done");
+  try {
+    await announce(port);
+    log("registered; waiting for the env to say done");
 
-  await waitUntilDone();
-  server.close();
-  log("done");
+    await waitUntilDone();
+    log("done");
+  } finally {
+    await stopForge(child);
+  }
 }
 
 run().then(
