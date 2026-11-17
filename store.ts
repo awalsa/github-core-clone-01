@@ -298,6 +298,8 @@ export interface Issue {
   labels: string[];
   comments: Comment[];
   seq: number;
+  /** Cached JSON body (with trailing newline) for GET single issue; null when stale. */
+  viewCache: Buffer | null;
 }
 
 export interface PullRequest {
@@ -330,6 +332,12 @@ export interface Repo {
   labels: Map<string, { name: string; color: string }>;
   seq: number;
   packCache: Map<string, { pack: Buffer | null; shallow: string[]; unshallow: string[] }>;
+  /** Cached ref-advertisement bytes per `${service}|${protocolVersion ?? ''}`. */
+  adCache: Map<string, Buffer>;
+  /** Cached ls-refs reply bytes per `${peel}|${symrefs}|${unborn}|${prefixes}`. */
+  lsRefsCache: Map<string, Buffer>;
+  /** Cached whole fetch replies per `${fetchPackKey}|v0|v2` (bench-shaped only). */
+  fetchResponseCache: Map<string, Buffer>;
 }
 
 export interface FileChange {
@@ -337,6 +345,19 @@ export interface FileChange {
   status: 'added' | 'removed' | 'modified';
   additions: number;
   deletions: number;
+}
+
+/** Clear every cache derived from a repo's refs (packs, advertisements, ls-refs, fetch replies). */
+export function clearRefCaches(repo: Repo): void {
+  repo.packCache.clear();
+  repo.adCache.clear();
+  repo.lsRefsCache.clear();
+  repo.fetchResponseCache.clear();
+}
+
+/** The cache key for a fetch pack (shared by buildFetchPack and the reply cache). */
+export function fetchPackKey(wants: string[], haves: string[], clientShallow: string[], depth: number): string {
+  return `${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${[...clientShallow].sort().join(',')}|${depth}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +473,9 @@ export class Store {
       labels: new Map(),
       seq: this.seqCounter,
       packCache: new Map(),
+      adCache: new Map(),
+      lsRefsCache: new Map(),
+      fetchResponseCache: new Map(),
     };
     this.repoIdCounter += 1;
     this.seqCounter += 1;
@@ -486,12 +510,12 @@ export class Store {
 
   setRef(repo: Repo, ref: string, oid: string): void {
     repo.refs.set(ref, oid);
-    repo.packCache.clear();
+    clearRefCaches(repo);
   }
 
   deleteRef(repo: Repo, ref: string): boolean {
     const ok = repo.refs.delete(ref);
-    if (ok) repo.packCache.clear();
+    if (ok) clearRefCaches(repo);
     return ok;
   }
 
@@ -779,7 +803,7 @@ export class Store {
    * clone workload is 50 concurrent shallow clones of one tip.
    */
   buildFetchPack(repo: Repo, wants: string[], haves: string[], clientShallow: string[], depth: number): { pack: Buffer | null; shallow: string[]; unshallow: string[] } {
-    const key = `${[...wants].sort().join(',')}|${[...haves].sort().join(',')}|${[...clientShallow].sort().join(',')}|${depth}`;
+    const key = fetchPackKey(wants, haves, clientShallow, depth);
     const cached = repo.packCache.get(key);
     if (cached !== undefined) return cached;
     const stopAt = new Set(clientShallow);
@@ -836,6 +860,7 @@ export class Store {
       labels: [...labelNames],
       comments: [],
       seq: this.seqCounter,
+      viewCache: null,
     };
     this.objectIdCounter += 1;
     repo.nextNumber += 1;
@@ -863,6 +888,7 @@ export class Store {
     const comment: Comment = { id: this.objectIdCounter, body };
     this.objectIdCounter += 1;
     issue.comments.push(comment);
+    issue.viewCache = null;
     return { comment };
   }
 
@@ -968,7 +994,7 @@ export class Store {
     const message = `Merge pull request #${pr.number} from ${pr.headRef}`;
     const commitOid = this.putObject('commit', buildCommit(treeOid, [baseTipCommit], message, FIXED_EPOCH_SEC));
     repo.refs.set(`refs/heads/${pr.baseRef}`, commitOid);
-    repo.packCache.clear();
+    clearRefCaches(repo);
     pr.state = 'closed';
     pr.merged = true;
     pr.mergedAt = FIXED_TS;

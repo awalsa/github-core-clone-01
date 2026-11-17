@@ -7,6 +7,8 @@ export interface RestResult {
   status: number;
   json: unknown;
   headers?: Record<string, string>;
+  /** Prebuilt JSON body bytes (with trailing newline); when set, `json` is ignored. */
+  raw?: Buffer;
 }
 
 export interface RestCtx {
@@ -389,7 +391,14 @@ export function restRoute(store: Store, ctx: RestCtx): RestResult {
       const issue = store.getIssue(repo, num);
       if (tail.length === 2) {
         if (!issue) return err(404, 'Not Found');
-        if (method === 'GET') return ok(200, issueView(issue, repo));
+        if (method === 'GET') {
+          // The issue view is immutable between mutations: serve the cached
+          // JSON bytes instead of rebuilding + stringifying per read.
+          if (issue.viewCache === null) {
+            issue.viewCache = Buffer.from(`${JSON.stringify(issueView(issue, repo))}\n`, 'utf8');
+          }
+          return { status: 200, json: null, raw: issue.viewCache };
+        }
         if (method === 'PATCH') {
           const { value, malformed } = parseBody(ctx);
           if (malformed) return err(400, 'malformed JSON body');
@@ -397,6 +406,7 @@ export function restRoute(store: Store, ctx: RestCtx): RestResult {
           if (typeof b.state === 'string' && (b.state === 'open' || b.state === 'closed')) issue.state = b.state;
           if (typeof b.title === 'string') issue.title = b.title;
           if (typeof b.body === 'string') issue.body = b.body;
+          issue.viewCache = null;
           return ok(200, issueView(issue, repo));
         }
         return err(404, 'Not Found');

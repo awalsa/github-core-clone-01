@@ -36,6 +36,16 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.end(text);
 }
 
+function sendRawJson(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': body.length,
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(body);
+}
+
 function sendRaw(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
   res.end(body);
@@ -59,12 +69,26 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-/** Parse the request URL once per request (path + query share the parse). */
-function urlOf(req: IncomingMessage): URL {
+/** An empty, never-mutated query set for URLs without '?'. */
+const EMPTY_PARAMS = new URLSearchParams();
+
+/**
+ * Split the request URL without a full URL parse when it is safe: no
+ * percent-escapes and no dot segments, so the raw slice is exactly what
+ * `new URL(...).pathname` would return. Anything else falls back to URL.
+ */
+function splitUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+  const raw = req.url ?? '/';
   try {
-    return new URL(req.url ?? '/', 'http://entry');
+    const q = raw.indexOf('?');
+    const path = q >= 0 ? raw.slice(0, q) : raw;
+    if (!path.includes('%') && !path.includes('#') && !path.includes('/./') && !path.includes('/../')) {
+      return { path, query: q >= 0 ? new URLSearchParams(raw.slice(q + 1)) : EMPTY_PARAMS };
+    }
+    const url = new URL(raw, 'http://entry');
+    return { path: url.pathname, query: url.searchParams };
   } catch {
-    return new URL('/');
+    return { path: '/', query: EMPTY_PARAMS };
   }
 }
 
@@ -82,9 +106,7 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const method = req.method ?? 'GET';
-      const url = urlOf(req);
-      const path = url.pathname;
-      const query = url.searchParams;
+      const { path, query } = splitUrl(req);
       try {
         // The env's boot check calls this twice: 200 {"ok":true}, no auth.
         if (method === 'GET' && path === '/healthz') {
@@ -132,6 +154,10 @@ export function createApp(): Server {
             host: req.headers.host ?? '127.0.0.1',
           };
           const out = restRoute(store, ctx);
+          if (out.raw !== undefined) {
+            sendRawJson(res, out.status, out.raw, out.headers ?? {});
+            return;
+          }
           sendJson(res, out.status, out.json, out.headers ?? {});
           return;
         }

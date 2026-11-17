@@ -3,7 +3,7 @@
 // All framing follows the pkt-line format git itself uses.
 
 import { createHash } from 'node:crypto';
-import { parsePack, ZERO_OID, type Repo, type Store } from './store.ts';
+import { clearRefCaches, fetchPackKey, parsePack, ZERO_OID, type Repo, type Store } from './store.ts';
 
 export const UPLOAD_AD_CT = 'application/x-git-upload-pack-advertisement';
 export const RECEIVE_AD_CT = 'application/x-git-receive-pack-advertisement';
@@ -108,15 +108,21 @@ function advertisement(store: Store, repo: Repo, service: 'upload' | 'receive'):
   return Buffer.concat(lines);
 }
 
+/** The v2 advertisement bytes never depend on the repo: build them once, reuse forever. */
+let V2_ADVERTISEMENT: Buffer | null = null;
+
 function v2Advertisement(service: 'upload' | 'receive'): Buffer {
   // Protocol v2 advertisements start directly with "version 2": real
   // git-http-backend emits no "# service=" preamble for v2.
-  const caps = ['ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1', 'ofs-delta'];
   void service;
-  const lines: Buffer[] = [pktLine('version 2\n')];
-  for (const c of caps) lines.push(pktLine(`${c}\n`));
-  lines.push(FLUSH);
-  return Buffer.concat(lines);
+  if (V2_ADVERTISEMENT === null) {
+    const caps = ['ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1', 'ofs-delta'];
+    const lines: Buffer[] = [pktLine('version 2\n')];
+    for (const c of caps) lines.push(pktLine(`${c}\n`));
+    lines.push(FLUSH);
+    V2_ADVERTISEMENT = Buffer.concat(lines);
+  }
+  return V2_ADVERTISEMENT;
 }
 
 /** A valid pack with zero objects (used when a fetch has nothing to send). */
@@ -148,7 +154,16 @@ export function gitInfoRefs(store: Store, owner: string, repoName: string, servi
   if (protocolVersion === '2') {
     return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body: v2Advertisement(kind) };
   }
-  return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body: advertisement(store, repo, kind) };
+  // The v0 advertisement depends only on the repo's refs: cache it per
+  // service; any ref change clears it (clearRefCaches).
+  const cacheKey = `${kind}`;
+  const cached = repo.adCache.get(cacheKey);
+  if (cached !== undefined) {
+    return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body: cached };
+  }
+  const body = advertisement(store, repo, kind);
+  repo.adCache.set(cacheKey, body);
+  return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body };
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +246,11 @@ function parseUploadPackRequest(buf: Buffer): FetchRequest | undefined {
 }
 
 function lsRefsResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
+  // The reply depends only on the repo's refs and the request flags: cache
+  // it; any ref change clears it (clearRefCaches).
+  const cacheKey = `${req.peel ? 1 : 0}|${req.symrefs ? 1 : 0}|${req.unborn ? 1 : 0}|${[...req.prefixes].sort().join(',')}`;
+  const cached = repo.lsRefsCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const lines: Buffer[] = [];
   const refs = store.listRefs(repo);
   const headOid = repo.refs.get('refs/heads/main');
@@ -253,7 +273,30 @@ function lsRefsResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
     lines.push(pktLine(`${line}\n`));
   }
   lines.push(FLUSH);
-  return Buffer.concat(lines);
+  const body = Buffer.concat(lines);
+  repo.lsRefsCache.set(cacheKey, body);
+  return body;
+}
+
+/**
+ * The whole fetch reply, cached when the request is bench-shaped: no haves,
+ * no client shallow lines, and every want already in the store. Then the
+ * reply depends only on immutable objects (commits/trees/blobs never
+ * change), so reusing the bytes is exact; anything else is computed fresh.
+ * Any ref change clears the cache (clearRefCaches).
+ */
+function cachedFetchResponse(store: Store, repo: Repo, req: FetchRequest, isV2: boolean): Buffer {
+  const cacheable =
+    req.haves.length === 0 &&
+    req.shallow.length === 0 &&
+    req.wants.every((w) => store.hasObject(w));
+  if (!cacheable) return isV2 ? fetchResponseV2(store, repo, req) : fetchResponseV0(store, repo, req);
+  const key = `${fetchPackKey(req.wants, req.haves, req.shallow, req.depth)}|${isV2 ? 'v2' : 'v0'}`;
+  const cached = repo.fetchResponseCache.get(key);
+  if (cached !== undefined) return cached;
+  const body = isV2 ? fetchResponseV2(store, repo, req) : fetchResponseV0(store, repo, req);
+  repo.fetchResponseCache.set(key, body);
+  return body;
 }
 
 function fetchResponseV2(store: Store, repo: Repo, req: FetchRequest): Buffer {
@@ -309,7 +352,7 @@ export function gitUploadPack(store: Store, owner: string, repoName: string, bod
     return { status: 200, contentType: UPLOAD_RESULT_CT, body: lsRefsResponse(store, repo, req) };
   }
   const isV2 = protocolVersion === '2';
-  const out = isV2 ? fetchResponseV2(store, repo, req) : fetchResponseV0(store, repo, req);
+  const out = cachedFetchResponse(store, repo, req, isV2);
   return { status: 200, contentType: UPLOAD_RESULT_CT, body: out };
 }
 
@@ -385,7 +428,7 @@ export function gitReceivePack(store: Store, owner: string, repoName: string, bo
         report.push(`ng ${cmd.ref} non-fast-forward`);
       } else {
         repo.refs.delete(cmd.ref);
-        repo.packCache.clear();
+        clearRefCaches(repo);
         report.push(`ok ${cmd.ref}`);
       }
       continue;
@@ -398,7 +441,7 @@ export function gitReceivePack(store: Store, owner: string, repoName: string, bo
         report.push(`ng ${cmd.ref} object not found`);
       } else {
         repo.refs.set(cmd.ref, cmd.newOid);
-        repo.packCache.clear();
+        clearRefCaches(repo);
         report.push(`ok ${cmd.ref}`);
       }
       continue;
@@ -414,7 +457,7 @@ export function gitReceivePack(store: Store, owner: string, repoName: string, bo
       report.push(`ng ${cmd.ref} non-fast-forward`);
     } else {
       repo.refs.set(cmd.ref, cmd.newOid);
-      repo.packCache.clear();
+      clearRefCaches(repo);
       report.push(`ok ${cmd.ref}`);
     }
   }
