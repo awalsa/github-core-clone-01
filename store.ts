@@ -21,7 +21,9 @@ export function sha1Hex(data: Buffer): string {
 
 export function hashObject(type: string, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Feed header and body as two updates: same digest as hashing the
+  // concatenation, without allocating the joined buffer per object.
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +230,11 @@ export function buildPack(objects: Map<string, GitObject>): Buffer {
   for (const oid of oids) {
     const obj = objects.get(oid)!;
     chunks.push(encodeObjectHeader(TYPE_NUM[obj.type], obj.data.length));
-    chunks.push(deflateSync(obj.data));
+    // Level 1: the pack is a wire format, not an archive — its bytes only
+    // need to inflate correctly, and the trailer checksums whatever was sent.
+    // Same bytes for the same input; roughly half the deflate time of the
+    // default level on the 1 KiB objects the workloads push.
+    chunks.push(deflateSync(obj.data, { level: 1 }));
   }
   const trailer = createHash('sha1');
   for (const c of chunks) trailer.update(c);
@@ -359,6 +365,11 @@ export class Store {
     const oid = hashObject(type, data);
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
     return oid;
+  }
+
+  /** Store an object whose oid is already known (e.g. a pack just parsed it). */
+  putObjectWithOid(oid: string, type: string, data: Buffer): void {
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
   }
 
   getObject(oid: string): GitObject | undefined {

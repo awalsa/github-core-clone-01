@@ -360,8 +360,10 @@ export function gitReceivePack(store: Store, owner: string, repoName: string, bo
   if (packBytes.length > 0) {
     try {
       const objs = parsePack(packBytes);
+      // parsePack already computed each oid; store them directly instead of
+      // re-hashing every object in putObject.
       for (const [oid, obj] of objs) {
-        if (!store.hasObject(oid)) store.putObject(obj.type, obj.data);
+        if (!store.hasObject(oid)) store.putObjectWithOid(oid, obj.type, obj.data);
       }
     } catch (err) {
       unpackOk = false;

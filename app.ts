@@ -53,37 +53,28 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Small bodies arrive in one chunk: return it without a concat copy.
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-function pathOf(req: IncomingMessage): string {
+/** Parse the request URL once per request (path + query share the parse). */
+function urlOf(req: IncomingMessage): URL {
   try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
+    return new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return '/';
-  }
-}
-
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
+    return new URL('/');
   }
 }
 
 /** The token every API call must present (the env sets MAKEFUN_SHOP_TOKEN). */
-function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
-}
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 function authorized(req: IncomingMessage): boolean {
-  const expected = expectedToken();
-  if (expected === '') return true;
+  if (EXPECTED_TOKEN === '') return true;
   const header = req.headers.authorization ?? '';
-  return header === `Bearer ${expected}`;
+  return header === `Bearer ${EXPECTED_TOKEN}`;
 }
 
 /** Build the server. It binds nothing until the caller listens. */
@@ -91,7 +82,9 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const method = req.method ?? 'GET';
-      const path = pathOf(req);
+      const url = urlOf(req);
+      const path = url.pathname;
+      const query = url.searchParams;
       try {
         // The env's boot check calls this twice: 200 {"ok":true}, no auth.
         if (method === 'GET' && path === '/healthz') {
@@ -134,7 +127,7 @@ export function createApp(): Server {
           const ctx: RestCtx = {
             method,
             segments,
-            query: queryOf(req),
+            query,
             bodyText: body.toString('utf8'),
             host: req.headers.host ?? '127.0.0.1',
           };
@@ -153,7 +146,6 @@ export function createApp(): Server {
           const protoHeader = (req.headers['git-protocol'] ?? '').toString();
           const protocolVersion = protoHeader.replace(/^version=/, '') || undefined;
           if (action === 'info/refs' && method === 'GET') {
-            const query = queryOf(req);
             out = gitInfoRefs(store, owner, repoName, query.get('service') ?? undefined, protocolVersion);
           } else if (action === 'git-upload-pack' && method === 'POST') {
             out = gitUploadPack(store, owner, repoName, body, protocolVersion);
