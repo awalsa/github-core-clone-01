@@ -22,11 +22,10 @@ func main() {
 		os.Exit(1)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
+	// fmt.Printf writes straight to the fd (no user-space buffering), so
+	// the entrypoint sees the line at once. Do NOT Sync stdout: syncing a
+	// pipe is an error and would kill the process here.
 	fmt.Printf("PORT=%d\n", port)
-	if err := os.Stdout.Sync(); err != nil {
-		fmt.Fprintf(os.Stderr, "[forge] stdout sync: %v\n", err)
-		os.Exit(1)
-	}
 
 	// Dead-man's switch: exit when the entrypoint closes our stdin.
 	go func() {
