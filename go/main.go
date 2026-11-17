@@ -3,16 +3,14 @@
 // stdout, then serves the forge over HTTP until its stdin closes (the
 // entrypoint keeps stdin open; when the entrypoint dies, stdin closes and
 // this process exits so no orphan keeps the port).
-//
-// This stub serves only /healthz; the full forge (git smart HTTP, REST v3,
-// GraphQL, MCP) lands here incrementally.
 package main
 
 import (
 	"fmt"
 	"net"
-	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -22,7 +20,7 @@ func main() {
 	// those connections and fail boot.
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[forge] listen: %v\n", err)
+		fmt.Fprintf(os.Stderr, "forge: listen: %v\n", err)
 		os.Exit(1)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
@@ -41,15 +39,17 @@ func main() {
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.Write([]byte("{\"ok\":true}\n"))
-	})
+	// Exit promptly on SIGTERM/SIGINT.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		os.Exit(0)
+	}()
 
-	srv := &http.Server{Handler: mux}
+	srv := newHTTPServer()
 	if err := srv.Serve(ln); err != nil {
-		fmt.Fprintf(os.Stderr, "[forge] serve: %v\n", err)
+		fmt.Fprintf(os.Stderr, "forge: serve: %v\n", err)
 		os.Exit(1)
 	}
 }

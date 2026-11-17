@@ -24,18 +24,8 @@
 //      and the scorer reads the export it writes.
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-
-/** Temporary debug log (removed before any submit). */
-function dbg(line: string): void {
-  try {
-    appendFileSync("/tmp/gocore-entry-debug.log", `${new Date().toISOString()} ${line}\n`);
-  } catch {
-    // Debugging must never break the entry.
-  }
-}
 
 /** One HTTP round trip may take at most this long before it is dropped. */
 const REQUEST_BUDGET_MS = 30_000;
@@ -142,10 +132,8 @@ async function waitUntilDone(): Promise<void> {
       const answer = await fetch(`${envOrigin}/done`, {
         signal: AbortSignal.timeout(REQUEST_BUDGET_MS),
       });
-      dbg(`done poll status=${answer.status}`);
       if (answer.ok) {
         const payload = (await answer.json()) as { done?: unknown };
-        dbg(`done poll payload=${JSON.stringify(payload)}`);
         if (payload.done === true) return;
       }
     } catch {
@@ -174,18 +162,14 @@ async function stopForge(child: ChildProcess): Promise<void> {
 
 /** The whole life of the process: start the forge, register, wait, stop it. */
 async function run(): Promise<void> {
-  dbg(`start envOrigin=${envOrigin} forgePath=${forgePath} cwd=${process.cwd()}`);
   const { child, port } = await startForge();
-  dbg(`forge started port=${port} pid=${child.pid} exitCode=${child.exitCode}`);
   log(`forge listening on port ${port}`);
 
   try {
     await announce(port);
-    dbg(`announced childExitCode=${child.exitCode}`);
     log("registered; waiting for the env to say done");
 
     await waitUntilDone();
-    dbg(`done childExitCode=${child.exitCode}`);
     log("done");
   } finally {
     await stopForge(child);
@@ -195,7 +179,6 @@ async function run(): Promise<void> {
 run().then(
   () => process.exit(0),
   (err: unknown) => {
-    dbg(`run failed: ${err instanceof Error ? err.message : String(err)}`);
     complain(err instanceof Error ? err.message : String(err));
     process.exit(1);
   },
