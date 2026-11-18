@@ -47,8 +47,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	srv := newHTTPServer()
-	if err := srv.Serve(ln); err != nil {
+	srv := newAppHandler()
+	if err := serveRaw(ln, srv); err != nil {
 		fmt.Fprintf(os.Stderr, "forge: serve: %v\n", err)
 		os.Exit(1)
 	}

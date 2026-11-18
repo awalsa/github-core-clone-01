@@ -1,12 +1,16 @@
-// app.go — the forge's HTTP server: one process serving git smart HTTP,
-// REST v3, GraphQL and MCP over the in-memory store. Only the Go standard
-// library is used. No wall clock appears in any response.
+// app.go — the forge's HTTP dispatch: git smart HTTP, REST v3, GraphQL
+// and MCP over the in-memory store. Only the Go standard library is used.
+// No wall clock appears in any response.
+//
+// Transport note: requests arrive as rawRequest values from rawhttp.go
+// (the hand-rolled HTTP/1.1 server that replaced net/http); responses are
+// built in memory as rawResponse values and written out in one Write.
+// The routing, auth, body cap and store-lock semantics are unchanged
+// from the net/http version.
 
 package main
 
 import (
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -30,49 +34,46 @@ type appHandler struct {
 	expectedToken string
 }
 
-func (h *appHandler) sendJSON(w http.ResponseWriter, status int, body []byte, headers map[string]string) {
+func copyHeaders(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+3)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func (h *appHandler) sendJSON(status int, body []byte, headers map[string]string) rawResponse {
 	// body is the JSON payload WITHOUT the trailing newline; Node's
 	// sendJson appends one.
+	hdrs := copyHeaders(headers)
+	hdrs["x-github-request-id"] = nextRequestID()
 	if status == 204 {
-		for k, v := range headers {
-			w.Header().Set(k, v)
-		}
-		w.Header().Set("x-github-request-id", nextRequestID())
-		w.WriteHeader(204)
-		return
+		return rawResponse{status: 204, headers: hdrs}
 	}
 	text := append(append([]byte(nil), body...), '\n')
-	for k, v := range headers {
-		w.Header().Set(k, v)
-	}
-	w.Header().Set("content-type", jsonType)
-	w.Header().Set("content-length", strconv.Itoa(len(text)))
-	w.Header().Set("x-github-request-id", nextRequestID())
-	w.WriteHeader(status)
-	_, _ = w.Write(text)
+	hdrs["content-type"] = jsonType
+	hdrs["content-length"] = strconv.Itoa(len(text))
+	return rawResponse{status: status, headers: hdrs, body: text}
 }
 
-func (h *appHandler) sendRawJSON(w http.ResponseWriter, status int, body []byte, headers map[string]string) {
+func (h *appHandler) sendRawJSON(status int, body []byte, headers map[string]string) rawResponse {
 	// body already includes its trailing newline (prebuilt cache bytes).
-	for k, v := range headers {
-		w.Header().Set(k, v)
-	}
-	w.Header().Set("content-type", jsonType)
-	w.Header().Set("content-length", strconv.Itoa(len(body)))
-	w.Header().Set("x-github-request-id", nextRequestID())
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	hdrs := copyHeaders(headers)
+	hdrs["content-type"] = jsonType
+	hdrs["content-length"] = strconv.Itoa(len(body))
+	hdrs["x-github-request-id"] = nextRequestID()
+	return rawResponse{status: status, headers: hdrs, body: body}
 }
 
-func (h *appHandler) sendRaw(w http.ResponseWriter, status int, contentType string, body []byte) {
-	w.Header().Set("content-type", contentType)
-	w.Header().Set("content-length", strconv.Itoa(len(body)))
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+func (h *appHandler) sendRaw(status int, contentType string, body []byte) rawResponse {
+	return rawResponse{status: status, headers: map[string]string{
+		"content-type":   contentType,
+		"content-length": strconv.Itoa(len(body)),
+	}, body: body}
 }
 
-func (h *appHandler) sendError(w http.ResponseWriter, status int, message string) {
-	h.sendJSON(w, status, marshalJSONNoNL(map[string]string{"message": message}), nil)
+func (h *appHandler) sendError(status int, message string) rawResponse {
+	return h.sendJSON(status, marshalJSONNoNL(map[string]string{"message": message}), nil)
 }
 
 // splitURL mirrors Node's splitUrl: a fast raw slice when the path has no
@@ -136,45 +137,39 @@ func cleanPath(p string) string {
 
 var gitRouteRegexp = regexp.MustCompile(`^/([^/]+)/([^/]+)\.git/(info/refs|git-upload-pack|git-receive-pack)$`)
 
-func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	method := r.Method
-	path, query := splitURL(r.URL.RequestURI())
+// handle dispatches one fully-read request and builds the response in
+// memory. A handler panic becomes a 500 with the error message, exactly
+// as the net/http version's recover did.
+func (h *appHandler) handle(req *rawRequest) (resp rawResponse) {
+	method := req.method
+	path, query := splitURL(req.target)
 
 	// The env's boot check calls this twice: 200 {"ok":true}, no auth.
 	if method == "GET" && path == "/healthz" {
-		h.sendJSON(w, 200, marshalJSONNoNL(map[string]bool{"ok": true}), nil)
-		return
+		return h.sendJSON(200, marshalJSONNoNL(map[string]bool{"ok": true}), nil)
 	}
 
 	// Everything else needs the shop token when one is configured.
 	if h.expectedToken != "" {
-		if r.Header.Get("Authorization") != "Bearer "+h.expectedToken {
-			h.sendError(w, 401, "Bad credentials")
-			return
+		if req.headers["authorization"] != "Bearer "+h.expectedToken {
+			return h.sendError(401, "Bad credentials")
 		}
 	}
 
 	needsBody := method == "POST" || method == "PUT" || method == "PATCH" || method == "DELETE"
 	var body []byte
 	if needsBody {
-		limited := io.LimitReader(r.Body, maxBodyBytes+1)
-		data, err := io.ReadAll(limited)
-		if err != nil {
-			h.sendError(w, 500, err.Error())
-			return
+		if req.bodyTooLarge {
+			return h.sendError(500, "body too large")
 		}
-		if len(data) > maxBodyBytes {
-			h.sendError(w, 500, "body too large")
-			return
-		}
-		body = data
+		body = req.body
 	} else {
 		body = []byte{}
 	}
 
 	// The store is single-writer: hold the lock for the whole dispatch.
-	// (Body reading happens above, outside the lock, so network I/O never
-	// blocks another request.)
+	// (Body reading happens in the transport, outside the lock, so
+	// network I/O never blocks another request.)
 	h.store.Lock()
 	defer h.store.Unlock()
 
@@ -188,8 +183,7 @@ func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else if s, ok := rec.(string); ok {
 				msg = s
 			}
-			// The header may already be sent; WriteHeader would be a no-op.
-			h.sendError(w, 500, msg)
+			resp = h.sendError(500, msg)
 		}
 	}()
 
@@ -197,11 +191,9 @@ func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if method == "POST" && path == "/mcp" {
 		out := mcpRoute(h.store, string(body))
 		if out.status == 202 {
-			w.WriteHeader(202)
-			return
+			return rawResponse{status: 202}
 		}
-		h.sendJSON(w, out.status, marshalOMap(out.json), nil)
-		return
+		return h.sendJSON(out.status, marshalOMap(out.json), nil)
 	}
 
 	// GraphQL: POST /api/graphql
@@ -209,8 +201,7 @@ func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status, out := graphqlRoute(h.store, string(body))
 		// graphqlRoute returns bytes without a trailing newline; sendJson
 		// adds one.
-		h.sendJSON(w, status, out, nil)
-		return
+		return h.sendJSON(status, out, nil)
 	}
 
 	// REST v3: /api/v3[/...]
@@ -227,22 +218,19 @@ func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		host := r.Host
+		host := req.host
 		if host == "" {
 			host = "127.0.0.1"
 		}
 		ctx := &RestCtx{Method: method, Segments: segments, Query: query, BodyText: string(body), Host: host}
 		out := RestRoute(h.store, ctx)
 		if out.Raw != nil {
-			h.sendRawJSON(w, out.Status, out.Raw, out.Headers)
-			return
+			return h.sendRawJSON(out.Status, out.Raw, out.Headers)
 		}
 		if out.Status == 204 {
-			h.sendJSON(w, 204, nil, out.Headers)
-			return
+			return h.sendJSON(204, nil, out.Headers)
 		}
-		h.sendJSON(w, out.Status, marshalJSONNoNL(out.JSON), out.Headers)
-		return
+		return h.sendJSON(out.Status, marshalJSONNoNL(out.JSON), out.Headers)
 	}
 
 	// Git smart HTTP: /{owner}/{repo}.git/...
@@ -250,7 +238,7 @@ func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		owner := decodeURIComponent(m[1])
 		repoName := decodeURIComponent(m[2])
 		action := m[3]
-		protoHeader := r.Header.Get("Git-Protocol")
+		protoHeader := req.headers["git-protocol"]
 		protocolVersion := strings.TrimPrefix(protoHeader, "version=")
 		if protocolVersion == "" {
 			protocolVersion = ""
@@ -265,27 +253,15 @@ func (h *appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case action == "git-receive-pack" && method == "POST":
 			out = GitReceivePack(h.store, owner, repoName, body)
 		default:
-			h.sendError(w, 404, "Not Found")
-			return
+			return h.sendError(404, "Not Found")
 		}
-		h.sendRaw(w, out.Status, out.ContentType, out.Body)
-		return
+		return h.sendRaw(out.Status, out.ContentType, out.Body)
 	}
 
 	// Everything else: GitHub's 404 body.
-	h.sendError(w, 404, "Not Found")
+	return h.sendError(404, "Not Found")
 }
 
 func newAppHandler() *appHandler {
 	return &appHandler{store: NewStore(), expectedToken: os.Getenv("MAKEFUN_SHOP_TOKEN")}
-}
-
-func newHTTPServer() *http.Server {
-	return &http.Server{
-		Handler: newAppHandler(),
-		// No timeouts: the Node original sets none either.
-		ReadTimeout:  0,
-		WriteTimeout: 0,
-		IdleTimeout:  0,
-	}
 }
