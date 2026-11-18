@@ -31,6 +31,12 @@ var profMu sync.Mutex
 var profStats = map[string]*profStat{}
 var profCount int64
 
+// profEnabled gates all profiling. Set HOTPATH_PROF=1 to enable.
+// (HOTPATH_PROFILE is the dump path, default /tmp/hotpath-profile.json.)
+// The profiler takes a mutex per request, which itself perturbs the
+// concurrent (clone) workload; it is a diagnostic, not part of the entry.
+var profEnabled = os.Getenv("HOTPATH_PROF") == "1"
+
 func profStatFor(route string) *profStat {
 	st, ok := profStats[route]
 	if !ok {
@@ -42,6 +48,9 @@ func profStatFor(route string) *profStat {
 
 // profRecord logs one handled request: lock-wait and hold time in µs.
 func profRecord(route string, waitUs, holdUs int64) {
+	if !profEnabled {
+		return
+	}
 	profMu.Lock()
 	st := profStatFor(route)
 	st.N++
@@ -70,6 +79,9 @@ func profRecord(route string, waitUs, holdUs int64) {
 
 // profCache records a cache hit (hit=true) or miss for a named cache.
 func profCache(name string, hit bool) {
+	if !profEnabled {
+		return
+	}
 	profMu.Lock()
 	st := profStatFor("cache:" + name)
 	if hit {
@@ -82,6 +94,9 @@ func profCache(name string, hit bool) {
 
 // profRecordIO logs transport-side time (kind "parse" or "write").
 func profRecordIO(kind string, us int64) {
+	if !profEnabled {
+		return
+	}
 	profMu.Lock()
 	st := profStatFor("_io")
 	if kind == "parse" {
