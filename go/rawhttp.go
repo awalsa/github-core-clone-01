@@ -77,6 +77,11 @@ func serveRaw(ln net.Listener, h *appHandler) error {
 
 func serveRawConn(conn net.Conn, h *appHandler) {
 	defer conn.Close()
+	// net/http sets TCP_NODELAY on accepted connections; without it Nagle
+	// delays small response writes under concurrency (clone blowups).
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
 	br := bufio.NewReaderSize(conn, 65536)
 	for {
 		tParse := time.Now()
