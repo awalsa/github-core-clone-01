@@ -1187,8 +1187,10 @@ func (s *Store) collectTree(treeOID string, objects *orderedSet) {
 func (s *Store) BuildFetchPack(repo *Repo, wants, haves, clientShallow []string, depth int) FetchPackResult {
 	key := fetchPackKey(wants, haves, clientShallow, depth)
 	if cached, ok := repo.PackCache[key]; ok {
+		profCache("pack", true)
 		return cached
 	}
+	profCache("pack", false)
 	stopAt := map[string]bool{}
 	for _, c := range clientShallow {
 		stopAt[c] = true

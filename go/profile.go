@@ -19,6 +19,12 @@ type profStat struct {
 	HoldUs  int64 `json:"hold_us"`
 	ParseUs int64 `json:"parse_us"`
 	WriteUs int64 `json:"write_us"`
+	MaxUs   int64 `json:"max_us"`
+	// hold-time histogram buckets: <100µs, 100-500µs, 500µs-2ms, 2-10ms, >10ms
+	Hist [5]int64 `json:"hist"`
+	// cache counters (fetch reply / pack build)
+	Hit  int64 `json:"hit"`
+	Miss int64 `json:"miss"`
 }
 
 var profMu sync.Mutex
@@ -41,10 +47,37 @@ func profRecord(route string, waitUs, holdUs int64) {
 	st.N++
 	st.WaitUs += waitUs
 	st.HoldUs += holdUs
+	if holdUs > st.MaxUs {
+		st.MaxUs = holdUs
+	}
+	switch {
+	case holdUs < 100:
+		st.Hist[0]++
+	case holdUs < 500:
+		st.Hist[1]++
+	case holdUs < 2000:
+		st.Hist[2]++
+	case holdUs < 10000:
+		st.Hist[3]++
+	default:
+		st.Hist[4]++
+	}
 	profMu.Unlock()
 	if atomic.AddInt64(&profCount, 1)%500 == 0 {
 		profDump()
 	}
+}
+
+// profCache records a cache hit (hit=true) or miss for a named cache.
+func profCache(name string, hit bool) {
+	profMu.Lock()
+	st := profStatFor("cache:" + name)
+	if hit {
+		st.Hit++
+	} else {
+		st.Miss++
+	}
+	profMu.Unlock()
 }
 
 // profRecordIO logs transport-side time (kind "parse" or "write").

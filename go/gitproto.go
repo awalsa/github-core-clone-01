@@ -444,8 +444,10 @@ func cachedFetchResponse(s *Store, repo *Repo, req *fetchRequest, isV2 bool) []b
 	}
 	key := fetchPackKey(req.wants, req.haves, req.shallow, req.depth) + "|" + ver
 	if cached, ok := repo.FetchResponseCache[key]; ok {
+		profCache("fetchReply", true)
 		return cached
 	}
+	profCache("fetchReply", false)
 	var body []byte
 	if isV2 {
 		body = fetchResponseV2(s, repo, req)
