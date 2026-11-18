@@ -392,12 +392,9 @@ export function restRoute(store: Store, ctx: RestCtx): RestResult {
       if (tail.length === 2) {
         if (!issue) return err(404, 'Not Found');
         if (method === 'GET') {
-          // The issue view is immutable between mutations: serve the cached
-          // JSON bytes instead of rebuilding + stringifying per read.
-          if (issue.viewCache === null) {
-            issue.viewCache = Buffer.from(`${JSON.stringify(issueView(issue, repo))}\n`, 'utf8');
-          }
-          return { status: 200, json: null, raw: issue.viewCache };
+          // NOCACHE VARIANT: the fd45ff1 issue viewCache is disabled for
+          // this experiment; the view is rebuilt + stringified per read.
+          return ok(200, issueView(issue, repo));
         }
         if (method === 'PATCH') {
           const { value, malformed } = parseBody(ctx);

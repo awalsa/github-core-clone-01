@@ -3,7 +3,7 @@
 // All framing follows the pkt-line format git itself uses.
 
 import { createHash } from 'node:crypto';
-import { clearRefCaches, fetchPackKey, parsePack, ZERO_OID, type Repo, type Store } from './store.ts';
+import { clearRefCaches, parsePack, ZERO_OID, type Repo, type Store } from './store.ts';
 
 export const UPLOAD_AD_CT = 'application/x-git-upload-pack-advertisement';
 export const RECEIVE_AD_CT = 'application/x-git-receive-pack-advertisement';
@@ -154,16 +154,9 @@ export function gitInfoRefs(store: Store, owner: string, repoName: string, servi
   if (protocolVersion === '2') {
     return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body: v2Advertisement(kind) };
   }
-  // The v0 advertisement depends only on the repo's refs: cache it per
-  // service; any ref change clears it (clearRefCaches).
-  const cacheKey = `${kind}`;
-  const cached = repo.adCache.get(cacheKey);
-  if (cached !== undefined) {
-    return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body: cached };
-  }
-  const body = advertisement(store, repo, kind);
-  repo.adCache.set(cacheKey, body);
-  return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body };
+  // NOCACHE VARIANT: the v0 advertisement is rebuilt every time (the
+  // fd45ff1 adCache is disabled for this experiment).
+  return { status: 200, contentType: kind === 'upload' ? UPLOAD_AD_CT : RECEIVE_AD_CT, body: advertisement(store, repo, kind) };
 }
 
 // ---------------------------------------------------------------------------
@@ -246,11 +239,7 @@ function parseUploadPackRequest(buf: Buffer): FetchRequest | undefined {
 }
 
 function lsRefsResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
-  // The reply depends only on the repo's refs and the request flags: cache
-  // it; any ref change clears it (clearRefCaches).
-  const cacheKey = `${req.peel ? 1 : 0}|${req.symrefs ? 1 : 0}|${req.unborn ? 1 : 0}|${[...req.prefixes].sort().join(',')}`;
-  const cached = repo.lsRefsCache.get(cacheKey);
-  if (cached !== undefined) return cached;
+  // NOCACHE VARIANT: the fd45ff1 lsRefsCache is disabled for this experiment.
   const lines: Buffer[] = [];
   const refs = store.listRefs(repo);
   const headOid = repo.refs.get('refs/heads/main');
@@ -273,30 +262,14 @@ function lsRefsResponse(store: Store, repo: Repo, req: FetchRequest): Buffer {
     lines.push(pktLine(`${line}\n`));
   }
   lines.push(FLUSH);
-  const body = Buffer.concat(lines);
-  repo.lsRefsCache.set(cacheKey, body);
-  return body;
+  return Buffer.concat(lines);
 }
 
-/**
- * The whole fetch reply, cached when the request is bench-shaped: no haves,
- * no client shallow lines, and every want already in the store. Then the
- * reply depends only on immutable objects (commits/trees/blobs never
- * change), so reusing the bytes is exact; anything else is computed fresh.
- * Any ref change clears the cache (clearRefCaches).
- */
-function cachedFetchResponse(store: Store, repo: Repo, req: FetchRequest, isV2: boolean): Buffer {
-  const cacheable =
-    req.haves.length === 0 &&
-    req.shallow.length === 0 &&
-    req.wants.every((w) => store.hasObject(w));
-  if (!cacheable) return isV2 ? fetchResponseV2(store, repo, req) : fetchResponseV0(store, repo, req);
-  const key = `${fetchPackKey(req.wants, req.haves, req.shallow, req.depth)}|${isV2 ? 'v2' : 'v0'}`;
-  const cached = repo.fetchResponseCache.get(key);
-  if (cached !== undefined) return cached;
-  const body = isV2 ? fetchResponseV2(store, repo, req) : fetchResponseV0(store, repo, req);
-  repo.fetchResponseCache.set(key, body);
-  return body;
+// NOCACHE VARIANT: the fd45ff1 whole-fetch-reply cache is disabled for
+// this experiment; fetch replies are always built fresh (the packCache
+// inside buildFetchPack is untouched).
+function fetchResponseDirect(store: Store, repo: Repo, req: FetchRequest, isV2: boolean): Buffer {
+  return isV2 ? fetchResponseV2(store, repo, req) : fetchResponseV0(store, repo, req);
 }
 
 function fetchResponseV2(store: Store, repo: Repo, req: FetchRequest): Buffer {
@@ -352,7 +325,7 @@ export function gitUploadPack(store: Store, owner: string, repoName: string, bod
     return { status: 200, contentType: UPLOAD_RESULT_CT, body: lsRefsResponse(store, repo, req) };
   }
   const isV2 = protocolVersion === '2';
-  const out = cachedFetchResponse(store, repo, req, isV2);
+  const out = fetchResponseDirect(store, repo, req, isV2);
   return { status: 200, contentType: UPLOAD_RESULT_CT, body: out };
 }
 
