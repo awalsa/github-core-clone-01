@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const jsonType = "application/json; charset=utf-8"
@@ -170,8 +171,15 @@ func (h *appHandler) handle(req *rawRequest) (resp rawResponse) {
 	// The store is single-writer: hold the lock for the whole dispatch.
 	// (Body reading happens in the transport, outside the lock, so
 	// network I/O never blocks another request.)
+	// [hotpath diagnostic] record lock-wait vs hold time per route.
+	rk := routeKey(method, path)
+	tLock0 := time.Now()
 	h.store.Lock()
-	defer h.store.Unlock()
+	tLock1 := time.Now()
+	defer func() {
+		h.store.Unlock()
+		profRecord(rk, tLock1.Sub(tLock0).Microseconds(), time.Since(tLock1).Microseconds())
+	}()
 
 	defer func() {
 		// Node's catch: 500 with the error message when headers are not
@@ -260,6 +268,38 @@ func (h *appHandler) handle(req *rawRequest) (resp rawResponse) {
 
 	// Everything else: GitHub's 404 body.
 	return h.sendError(404, "Not Found")
+}
+
+// routeKey classifies a request for the hotpath profiler (coarse).
+func routeKey(method, path string) string {
+	if method == "GET" && path == "/healthz" {
+		return "GET healthz"
+	}
+	if method == "POST" && path == "/mcp" {
+		return "POST /mcp"
+	}
+	if method == "POST" && path == "/api/graphql" {
+		return "POST /api/graphql"
+	}
+	if path == "/api/v3" || strings.HasPrefix(path, "/api/v3/") {
+		if strings.Contains(path, "/issues/") && method == "GET" {
+			return "REST GET issue"
+		}
+		if strings.HasSuffix(path, "/issues") && method == "POST" {
+			return "REST POST issue"
+		}
+		return "REST other"
+	}
+	if strings.HasSuffix(path, "/info/refs") {
+		return "GET info/refs"
+	}
+	if strings.HasSuffix(path, "/git-upload-pack") {
+		return "POST upload-pack"
+	}
+	if strings.HasSuffix(path, "/git-receive-pack") {
+		return "POST receive-pack"
+	}
+	return "other"
 }
 
 func newAppHandler() *appHandler {

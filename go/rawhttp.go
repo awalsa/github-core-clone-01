@@ -22,6 +22,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // rawRequest is the whole of a parsed HTTP request the handlers need.
@@ -78,14 +79,19 @@ func serveRawConn(conn net.Conn, h *appHandler) {
 	defer conn.Close()
 	br := bufio.NewReaderSize(conn, 65536)
 	for {
+		tParse := time.Now()
 		req, ok := readRawRequest(br, conn)
+		profRecordIO("parse", time.Since(tParse).Microseconds())
 		if !ok {
 			return
 		}
 		resp := h.handle(req)
+		tWrite := time.Now()
 		if !writeRawResponse(conn, req, resp) {
+			profRecordIO("write", time.Since(tWrite).Microseconds())
 			return
 		}
+		profRecordIO("write", time.Since(tWrite).Microseconds())
 		if !req.keepAlive {
 			return
 		}

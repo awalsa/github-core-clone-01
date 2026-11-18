@@ -44,6 +44,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigCh
+		profDump() // [hotpath diagnostic] flush profile before exit
 		os.Exit(0)
 	}()
 
